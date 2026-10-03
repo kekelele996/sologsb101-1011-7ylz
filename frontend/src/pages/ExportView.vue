@@ -74,8 +74,8 @@ async function buildConclusions(): Promise<void> {
   const fits = ratingStore.lineNos.map((lineNo) =>
     fitPowerCurve(
       payload.ratings
-        .filter((rating) => rating.lineNo === lineNo)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
+        .filter((rating) => rating.lineNo === lineNo && rating.datumStatus === 'folded')
+        .map((rating) => ({ stageM: rating.datumStageM ?? rating.stageM, flowM3s: rating.flowM3s })),
       lineNo
     )
   )
@@ -135,7 +135,7 @@ async function handleImport(): Promise<void> {
 async function handleReset(): Promise<void> {
   try {
     await ElMessageBox.confirm(
-      '将清空全部本地数据并重新播种演示数据（测站、断面、垂线、测点、点据、比测）。确认继续？',
+      '将清空全部本地数据并重新播种演示数据（测站、断面、垂线、测点、点据、比测、水尺接测、定线版本）。确认继续？',
       '重置本地数据',
       { type: 'warning', confirmButtonText: '清空并重建', cancelButtonText: '取消' }
     )
@@ -253,9 +253,9 @@ onMounted(() => {
             <el-tag size="small" effect="plain">{{ row.lineNo }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="水位 (m)" width="110" align="right">
+        <el-table-column label="基面水位 H' (m)" width="150" align="right">
           <template #default="{ row }">
-            <span class="gb-mono">{{ row.rating ? row.rating.stageM.toFixed(2) : '—' }}</span>
+            <span class="gb-mono">{{ row.rating && row.rating.datumStageM !== null ? row.rating.datumStageM.toFixed(3) : '待站上认' }}</span>
           </template>
         </el-table-column>
         <el-table-column label="实测流量" width="130" align="right">
@@ -290,7 +290,8 @@ onMounted(() => {
       <div class="gb-panel-title">
         <h3>全量 JSON 导入导出</h3>
         <span class="gb-hint">
-          导出内容包含 stations / sections / verticals / points / ratings / compares 六张表
+          导出内容包含 stations / sections / verticals / points / ratings / compares，
+          以及站上接测 gaugeSurveys 与资料室定线 ratingLineStates / ratingVersions / recalcJobs 共十张表
         </span>
       </div>
 
@@ -333,6 +334,12 @@ onMounted(() => {
         </el-descriptions-item>
         <el-descriptions-item label="点据 / 比测">
           {{ counts.ratings ?? 0 }} / {{ counts.compares ?? 0 }}
+        </el-descriptions-item>
+        <el-descriptions-item label="接测记录">
+          {{ counts.gaugeSurveys ?? 0 }}
+        </el-descriptions-item>
+        <el-descriptions-item label="报出版本 / 重算任务">
+          {{ counts.ratingVersions ?? 0 }} / {{ counts.recalcJobs ?? 0 }}
         </el-descriptions-item>
         <el-descriptions-item label="最近备份时间">
           {{ lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份' }}

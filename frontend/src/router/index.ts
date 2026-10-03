@@ -2,7 +2,8 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 
 /**
  * 路由表：路径与提示词逐字一致。
- * /stations、/stations/:id/sections、/sections/:id/verticals、/verticals/:id/points、/ratings、/export
+ * /stations、/stations/:id/sections、/sections/:id/verticals、/verticals/:id/points、
+ * /surveys（站上水尺接测）、/ratings、/datum-room（资料室基面折算定线）、/export
  * 全部页面懒加载，构建时自动分包。
  */
 const routes: RouteRecordRaw[] = [
@@ -32,10 +33,22 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '流速测点录入', icon: 'DataLine' }
   },
   {
+    path: '/surveys',
+    name: 'survey-board',
+    component: () => import('@/pages/SurveyBoard.vue'),
+    meta: { title: '水尺接测（站上）', icon: 'Aim' }
+  },
+  {
     path: '/ratings',
     name: 'rating-chart',
     component: () => import('@/pages/RatingChart.vue'),
     meta: { title: '水位流量关系点据', icon: 'TrendCharts' }
+  },
+  {
+    path: '/datum-room',
+    name: 'datum-room',
+    component: () => import('@/pages/DatumRoom.vue'),
+    meta: { title: '基面折算定线（资料室）', icon: 'SetUp' }
   },
   {
     path: '/export',

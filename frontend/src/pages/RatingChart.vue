@@ -14,6 +14,7 @@ import DeviationTag from '@/components/common/DeviationTag.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import { useRatingStore } from '@/stores/ratingStore'
 import { useStationStore } from '@/stores/stationStore'
+import { useDatumStore } from '@/stores/datumStore'
 import { fitPowerCurve, type Rating, type RatingFitResult } from '@/types/rating'
 import { initDatabase } from '@/utils/db'
 
@@ -21,6 +22,7 @@ const route = useRoute()
 const router = useRouter()
 const ratingStore = useRatingStore()
 const stationStore = useStationStore()
+const datumStore = useDatumStore()
 
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
@@ -37,24 +39,30 @@ const form = reactive({
 const fit = computed(() => ratingStore.activeFit)
 const lineNos = computed(() => (ratingStore.lineNos.length > 0 ? ratingStore.lineNos : ['A']))
 
-/** 当前定线号下的点据（含曲线流量与残差） */
+/** 当前定线号下的点据（统一基面水位、曲线流量与残差；未折算点据单列待站上认） */
 const pointRows = computed(() =>
   ratingStore.ratings
     .filter((rating) => rating.lineNo === ratingStore.activeLineNo)
-    .sort((a, b) => a.stageM - b.stageM)
+    .sort((a, b) => (a.datumStageM ?? a.stageM) - (b.datumStageM ?? b.stageM))
     .map((rating) => {
-      const predicted = fit.value.valid ? Number((fit.value.a * Math.pow(Math.max(rating.stageM - fit.value.h0, 1e-6), fit.value.b)).toFixed(2)) : 0
+      const datumStage = rating.datumStageM ?? rating.stageM
+      const folded = rating.datumStatus === 'folded'
+      const predicted = fit.value.valid && folded ? Number((fit.value.a * Math.pow(Math.max(datumStage - fit.value.h0, 1e-6), fit.value.b)).toFixed(2)) : 0
       const residualPct =
-        fit.value.valid && rating.flowM3s > 0
+        fit.value.valid && folded && rating.flowM3s > 0
           ? Number((((rating.flowM3s - predicted) / rating.flowM3s) * 100).toFixed(2))
           : 0
       const compare = ratingStore.compares.find((item) => item.ratingId === rating.id)
       return {
         rating,
+        datumStage,
         stationName: ratingStore.stationNameOf(rating.stationId),
         predicted,
         residualPct,
-        verdict: compare?.verdict ?? (Math.abs(residualPct) > ratingStore.deviationLimitPct ? '超限' : '合格')
+        folded,
+        verdict: !folded
+          ? ('待认' as const)
+          : compare?.verdict ?? (Math.abs(residualPct) > ratingStore.deviationLimitPct ? '超限' : '合格')
       }
     })
 )
@@ -68,11 +76,11 @@ const filterModel = computed<FilterModel>(() => ({
 
 /** 关系曲线坐标：横轴水位、纵轴流量 */
 const chart = computed(() => {
-  const rows = pointRows.value
+  const rows = pointRows.value.filter((row) => row.folded)
   if (rows.length === 0) {
     return { samples: '', points: [] as Array<{ id: string; cx: number; cy: number; verdict: string }>, stageMin: 0, stageMax: 0, flowMax: 0 }
   }
-  const stages = rows.map((row) => row.rating.stageM)
+  const stages = rows.map((row) => row.datumStage)
   const flows = rows.map((row) => row.rating.flowM3s)
   const stageMin = Math.min(...stages)
   const stageMax = Math.max(...stages)
@@ -94,7 +102,7 @@ const chart = computed(() => {
     samples,
     points: rows.map((row) => ({
       id: row.rating.id,
-      cx: toX(row.rating.stageM),
+      cx: toX(row.datumStage),
       cy: toY(row.rating.flowM3s),
       verdict: row.verdict
     })),
@@ -148,18 +156,22 @@ async function submitForm(): Promise<void> {
       flowM3s: form.flowM3s,
       lineNo: form.lineNo.trim() || 'A',
       measureNo: form.measureNo.trim(),
-      measuredAt: form.measuredAt ? new Date(form.measuredAt).toISOString() : new Date().toISOString()
+      measuredAt: form.measuredAt ? new Date(form.measuredAt).toISOString() : new Date().toISOString(),
+      datumStageM: null,
+      zeroSurveyId: null,
+      datumStatus: 'unmatched' as const
     }
     if (editingId.value) {
       await ratingStore.updateRating(editingId.value, payload)
-      ElMessage.success('点据已更新')
+      ElMessage.success('点据已更新，已交资料室按零点重新折算')
     } else {
       await ratingStore.createRating(payload)
-      ElMessage.success('点据已新增，正在重算定线')
+      ElMessage.success('点据已新增，已交资料室按当时零点折算并重算')
     }
     ratingStore.setActiveLine(payload.lineNo)
     dialogVisible.value = false
-    await ratingStore.rebuildCompares(payload.lineNo)
+    // 折算与比测重算走资料室侧任务（含重试），不直接在站上读数上改
+    await datumStore.recalcLine(payload.lineNo, payload.stationId)
   } finally {
     submitting.value = false
   }
@@ -176,29 +188,29 @@ async function removeRating(rating: Rating): Promise<void> {
     return
   }
   await ratingStore.removeRating(rating.id)
-  await ratingStore.rebuildCompares(rating.lineNo)
-  ElMessage.success('点据已删除并重算定线')
+  await datumStore.recalcLine(rating.lineNo, rating.stationId)
+  ElMessage.success('点据已删除，资料室已重算定线')
 }
 
 async function refit(): Promise<void> {
+  await datumStore.recalcLine(ratingStore.activeLineNo, pointRows.value[0]?.rating.stationId ?? '')
   const result: RatingFitResult = fitPowerCurve(
-    pointRows.value.map((row) => ({ stageM: row.rating.stageM, flowM3s: row.rating.flowM3s })),
+    pointRows.value
+      .filter((row) => row.folded)
+      .map((row) => ({ stageM: row.datumStage, flowM3s: row.rating.flowM3s })),
     ratingStore.activeLineNo
   )
-  ratingStore.setFit(result)
-  const count = await ratingStore.rebuildCompares(ratingStore.activeLineNo)
   if (result.valid) {
     ElMessage.success(
-      `定线完成：Q = ${result.a}×(H-${result.h0})^${result.b}，平均残差 ${result.meanResidualPct}%，刷新比测 ${count} 条`
+      `已按统一基面水位定线：Q = ${result.a}×(H'-${result.h0})^${result.b}，平均残差 ${result.meanResidualPct}%`
     )
   } else {
-    ElMessage.warning(result.message || '当前点据不足以定线')
+    ElMessage.warning(result.message || '当前已折算点据不足以定线')
   }
 }
 
 function handleLineChange(lineNo: string | number | boolean | undefined): void {
   ratingStore.setActiveLine(String(lineNo))
-  void ratingStore.rebuildCompares(String(lineNo))
 }
 
 function handleFilterChange(): void {
@@ -219,6 +231,7 @@ function handleReset(): void {
 
 onMounted(() => {
   if (stationStore.stations.length === 0) void initDatabase()
+  datumStore.start()
   const query = route.query
   ratingStore.patchFilter({
     keyword: typeof query.kw === 'string' ? query.kw : '',
@@ -229,7 +242,8 @@ onMounted(() => {
         ? (query.verdict.split(',').filter((item) => item === '合格' || item === '超限') as Array<'合格' | '超限'>)
         : []
   })
-  void ratingStore.rebuildCompares(ratingStore.activeLineNo)
+  // 待处理的基面重算任务在资料室侧自动执行（失败任务须在资料室页显式重试）
+  void datumStore.runPending()
 })
 </script>
 
@@ -241,7 +255,8 @@ onMounted(() => {
       <div>
         <h2 class="page__title">水位流量关系点据与定线</h2>
         <p class="gb-hint">
-          点据按定线号分组做幂函数拟合 Q = a×(H-H0)^b，残差超过 {{ ratingStore.deviationLimitPct }}% 的点据自动挂红并进入比测分析清单。
+          水尺读数按测流当时生效的水尺零点折到统一基面水位 H′，再做幂函数拟合 Q = a×(H′-H0)^b；
+          残差超过 {{ ratingStore.deviationLimitPct }}% 自动挂红。对不上时间的点据先交站上认零点，不参与定线。
         </p>
       </div>
       <div class="page__actions">
@@ -283,18 +298,18 @@ onMounted(() => {
     <div class="gb-stats-row">
       <StatBadge label="current 线点据" :value="pointRows.length" suffix="点" icon="DataLine" />
       <StatBadge
+        label="待站上认零点"
+        :value="pointRows.filter((row) => !row.folded).length"
+        suffix="点"
+        :tone="pointRows.some((row) => !row.folded) ? 'warning' : 'success'"
+        icon="WarningFilled"
+      />
+      <StatBadge
         label="定线系数 a"
         :value="fit.valid ? fit.a : '—'"
         :suffix="fit.valid ? `b=${fit.b}` : '未定线'"
         tone="info"
         icon="TrendCharts"
-      />
-      <StatBadge
-        label="平均残差"
-        :value="fit.valid ? fit.meanResidualPct : '—'"
-        suffix="%"
-        :tone="fit.valid && fit.meanResidualPct <= ratingStore.deviationLimitPct ? 'success' : 'warning'"
-        icon="Histogram"
       />
       <StatBadge
         label="超限点据"
@@ -306,18 +321,25 @@ onMounted(() => {
     </div>
 
     <el-alert
-      v-if="!fit.valid"
+      v-if="pointRows.some((row) => !row.folded)"
       type="warning"
       show-icon
       :closable="false"
-      :title="fit.message || '当前定线号下点据不足，至少需要 3 个实测点才能定线'"
+      title="存在对不上水尺接测时间的点据，已挑出交站上确认零点；确认前不参与定线与比测。"
+    />
+    <el-alert
+      v-else-if="!fit.valid"
+      type="warning"
+      show-icon
+      :closable="false"
+      :title="fit.message || '当前定线号下已折算点据不足，至少需要 3 个实测点才能定线'"
     />
     <el-alert
       v-else
       type="success"
       show-icon
       :closable="false"
-      :title="`${fit.lineNo} 线定线有效：Q = ${fit.a} × (H - ${fit.h0})^${fit.b}；样本 ${fit.sampleCount} 点，平均残差 ${fit.meanResidualPct}%，最大残差 ${fit.maxResidualPct}%`"
+      :title="`${fit.lineNo} 线定线有效（统一基面）：Q = ${fit.a} × (H′ - ${fit.h0})^${fit.b}；样本 ${fit.sampleCount} 点，平均残差 ${fit.meanResidualPct}%，最大残差 ${fit.maxResidualPct}%`"
     />
 
     <div class="page__grid">
@@ -330,24 +352,36 @@ onMounted(() => {
       />
 
       <el-table v-else :data="pointRows" border stripe class="gb-table-compact">
-        <el-table-column label="水位 (m)" width="110" align="right">
+        <el-table-column label="水尺读数 (m)" width="120" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.rating.stageM.toFixed(2) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="实测流量 (m³/s)" width="150" align="right">
+        <el-table-column label="基面水位 H′ (m)" width="140" align="right">
+          <template #default="{ row }">
+            <span v-if="row.folded" class="gb-mono">{{ row.datumStage.toFixed(3) }}</span>
+            <el-tag v-else size="small" type="warning" effect="plain">待站上认</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="实测流量 (m³/s)" width="140" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.rating.flowM3s.toFixed(1) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="曲线流量 (m³/s)" width="150" align="right">
+        <el-table-column label="曲线流量 (m³/s)" width="140" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.predicted > 0 ? row.predicted.toFixed(1) : '—' }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="残差" width="200">
+        <el-table-column label="残差 / 判定" width="200">
           <template #default="{ row }">
-            <DeviationTag :deviation-pct="row.residualPct" :verdict="row.verdict" :limit="ratingStore.deviationLimitPct" />
+            <DeviationTag
+              v-if="row.folded"
+              :deviation-pct="row.residualPct"
+              :verdict="row.verdict"
+              :limit="ratingStore.deviationLimitPct"
+            />
+            <el-tag v-else size="small" type="warning">时间对不上，待认</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="测站 / 测次" min-width="180">
@@ -380,7 +414,7 @@ onMounted(() => {
           <text x="6" y="24" class="gb-chart-axis">{{ chart.flowMax.toFixed(0) }}</text>
           <text x="14" y="194" class="gb-chart-axis">0</text>
           <text x="52" y="208" class="gb-chart-axis">{{ chart.stageMin.toFixed(2) }}</text>
-          <text x="300" y="208" class="gb-chart-axis">{{ chart.stageMax.toFixed(2) }} m</text>
+          <text x="300" y="208" class="gb-chart-axis">{{ chart.stageMax.toFixed(2) }} m（基面）</text>
           <polyline v-if="fit.valid" :points="chart.samples" fill="none" stroke="#0f4c75" stroke-width="2" />
           <circle
             v-for="point in chart.points"
@@ -407,9 +441,9 @@ onMounted(() => {
         <el-form-item label="定线号" required>
           <el-input v-model="form.lineNo" placeholder="如 A / B / C" maxlength="8" />
         </el-form-item>
-        <el-form-item label="水位" required>
+        <el-form-item label="水尺读数" required>
           <el-input-number v-model="form.stageM" :min="-50" :max="200" :step="0.01" :precision="2" controls-position="right" />
-          <span class="page__unit">m</span>
+          <span class="page__unit">m（保存后由资料室按当时零点折基面）</span>
         </el-form-item>
         <el-form-item label="流量" required>
           <el-input-number v-model="form.flowM3s" :min="0.01" :max="100000" :step="1" :precision="1" controls-position="right" />

@@ -18,9 +18,8 @@ export const useRatingStore = defineStore('rating', () => {
   const ready = ref(false)
   const error = ref<string | null>(null)
   const filter = ref<RatingFilterState>(createEmptyRatingFilter())
-  /** 当前定线号与定线参数（跨页保留） */
+  /** 当前定线号（跨页保留）；拟合参数始终由当前折算点据实时派生，不做缓存 */
   const activeLineNo = ref<string>('A')
-  const fits = ref<RatingFitResult[]>([])
   const deviationLimitPct = ref<number>(DEVIATION_LIMIT_PCT)
 
   let started = false
@@ -50,36 +49,38 @@ export const useRatingStore = defineStore('rating', () => {
   const stationNameOf = (stationId: string): string =>
     stations.value.find((station) => station.id === stationId)?.name ?? '未知测站'
 
-  /** 逐定线号的拟合结果（幂函数定线） */
+  /** 逐定线号的拟合结果（幂函数定线，水位取折到统一基面的 datumStageM） */
   const allFits = computed<RatingFitResult[]>(() =>
     lineNos.value.map((lineNo) => {
       const points = ratings.value
-        .filter((rating) => rating.lineNo === lineNo)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s }))
+        .filter((rating) => rating.lineNo === lineNo && rating.datumStatus === 'folded')
+        .map((rating) => ({ stageM: rating.datumStageM ?? rating.stageM, flowM3s: rating.flowM3s }))
       return fitPowerCurve(points, lineNo)
     })
   )
 
   const activeFit = computed<RatingFitResult>(() => {
-    const cached = fits.value.find((fit) => fit.lineNo === activeLineNo.value)
-    if (cached) return cached
     const computedFit = allFits.value.find((fit) => fit.lineNo === activeLineNo.value)
     if (computedFit) return computedFit
     return fitPowerCurve([], activeLineNo.value)
   })
 
-  /** 点据 + 曲线流量 + 残差 */
+  /** 点据 + 曲线流量 + 残差（曲线基于统一基面水位，对不上时间的点据单列提示） */
   const pointRows = computed(() =>
     ratings.value
       .filter((rating) => rating.lineNo === activeLineNo.value)
-      .sort((a, b) => a.stageM - b.stageM)
+      .sort((a, b) => (a.datumStageM ?? a.stageM) - (b.datumStageM ?? b.stageM))
       .map((rating) => {
-        const predicted = activeFit.value.valid ? curveFlow(activeFit.value, rating.stageM) : 0
+        const datumStage = rating.datumStageM ?? rating.stageM
+        const predicted =
+          activeFit.value.valid && rating.datumStatus === 'folded'
+            ? curveFlow(activeFit.value, datumStage)
+            : 0
         const residualPct =
-          activeFit.value.valid && rating.flowM3s > 0
+          activeFit.value.valid && rating.datumStatus === 'folded' && rating.flowM3s > 0
             ? Number((((rating.flowM3s - predicted) / rating.flowM3s) * 100).toFixed(2))
             : 0
-        return { rating, predicted, residualPct }
+        return { rating, datumStage, predicted, residualPct }
       })
   )
 
@@ -157,11 +158,6 @@ export const useRatingStore = defineStore('rating', () => {
     activeLineNo.value = lineNo
   }
 
-  function setFit(fit: RatingFitResult): void {
-    const others = fits.value.filter((item) => item.lineNo !== fit.lineNo)
-    fits.value = [...others, fit]
-  }
-
   function setDeviationLimit(limit: number): void {
     deviationLimitPct.value = limit
   }
@@ -187,23 +183,23 @@ export const useRatingStore = defineStore('rating', () => {
   }
 
   /**
-   * 由点据生成 / 刷新比测记录：曲线流量取当前定线拟合值，
-   * 偏差超过限值自动判定超限并进入分析清单。
+   * 由点据生成 / 刷新比测记录：曲线按统一基面水位的当前定线拟合值取值，
+   * 偏差超过限值自动判定超限并进入分析清单；时间对不上、未折基面的点据不比测。
    */
   async function rebuildCompares(lineNo?: string): Promise<number> {
     const targetLine = lineNo ?? activeLineNo.value
+    const targets = ratings.value.filter(
+      (rating) => rating.lineNo === targetLine && rating.datumStatus === 'folded'
+    )
     const fit = fitPowerCurve(
-      ratings.value
-        .filter((rating) => rating.lineNo === targetLine)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
+      targets.map((rating) => ({ stageM: rating.datumStageM ?? rating.stageM, flowM3s: rating.flowM3s })),
       targetLine
     )
-    setFit(fit)
-    const targets = ratings.value.filter((rating) => rating.lineNo === targetLine)
     if (targets.length === 0) return 0
     const now = Date.now()
     const rows: Compare[] = targets.map((rating) => {
-      const predicted = fit.valid ? curveFlow(fit, rating.stageM) : rating.flowM3s
+      const datumStage = rating.datumStageM ?? rating.stageM
+      const predicted = fit.valid ? curveFlow(fit, datumStage) : rating.flowM3s
       const deviationPct = calcDeviationPct(rating.flowM3s, predicted)
       const existing = compares.value.find((item) => item.ratingId === rating.id)
       return {
@@ -262,7 +258,6 @@ export const useRatingStore = defineStore('rating', () => {
     filter,
     activeLineNo,
     activeFit,
-    fits,
     deviationLimitPct,
     lineNos,
     allFits,
@@ -277,7 +272,6 @@ export const useRatingStore = defineStore('rating', () => {
     patchFilter,
     resetFilter,
     setActiveLine,
-    setFit,
     setDeviationLimit,
     createRating,
     updateRating,

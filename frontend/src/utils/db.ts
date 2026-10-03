@@ -12,12 +12,16 @@ import type { Vertical } from '@/types/vertical'
 import type { Point } from '@/types/point'
 import type { Rating } from '@/types/rating'
 import type { Compare } from '@/types/compare'
+import type { GaugeSurvey } from '@/types/gaugeSurvey'
+import type { RatingLineState, RatingVersion } from '@/types/ratingVersion'
+import type { RecalcJob } from '@/types/recalc'
 import { calcDeviationPct, judgeDeviation } from '@/types/compare'
 import { fitPowerCurve } from '@/types/rating'
 import { calcMeanVelocity, DEFAULT_WEIGHTS, round } from '@/utils/flow'
+import { foldRatings, planLegacyBackfill } from '@/utils/datum'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbhydrogaug'
@@ -40,6 +44,12 @@ export interface BackupPayload {
   points: Point[]
   ratings: Rating[]
   compares: Compare[]
+  /** 站上侧：水尺接测记录（只追加） */
+  gaugeSurveys: GaugeSurvey[]
+  /** 资料室侧：定线状态 / 报出版本 / 基面重算任务 */
+  ratingLineStates: RatingLineState[]
+  ratingVersions: RatingVersion[]
+  recalcJobs: RecalcJob[]
 }
 
 class HydroGaugeDatabase extends Dexie {
@@ -49,6 +59,10 @@ class HydroGaugeDatabase extends Dexie {
   points!: Table<Point, string>
   ratings!: Table<Rating, string>
   compares!: Table<Compare, string>
+  gaugeSurveys!: Table<GaugeSurvey, string>
+  ratingLineStates!: Table<RatingLineState, string>
+  ratingVersions!: Table<RatingVersion, string>
+  recalcJobs!: Table<RecalcJob, string>
 
   constructor() {
     super(DB_NAME)
@@ -94,6 +108,85 @@ class HydroGaugeDatabase extends Dexie {
               Object.assign(row, defaults())
             })
         }
+      })
+
+    // v3：水尺接测记录（站上）与统一基面折算定线（资料室）分账
+    this.version(DB_VERSION)
+      .stores({
+        ratings: 'id, stationId, lineNo, stageM, datumStageM, flowM3s, datumStatus, measuredAt, updatedAt',
+        gaugeSurveys: 'id, stationId, gaugeCode, surveyedAt, backfilled',
+        ratingLineStates: 'id, lineNo, stationId, status, needsRecalc',
+        ratingVersions: 'id, lineNo, stationId, versionNo, publishedAt',
+        recalcJobs: 'id, lineNo, stationId, status, createdAt'
+      })
+      .upgrade(async (tx) => {
+        // 旧数据没有零点记录：按「本站最近一次测流」回填一条接测（零点暂取 0，标记回填）；
+        // 早于回填接测时间的点据仍对不上时间，折算不出基面，挑出来交站上确认。
+        const oldRatings = await tx.table<Rating, string>('ratings').toArray()
+        const existingSurveys = await tx.table<GaugeSurvey, string>('gaugeSurveys').toArray()
+        const now = Date.now()
+        const backfilled = planLegacyBackfill(oldRatings, existingSurveys, (prefix) => createId(prefix), now)
+        if (backfilled.length > 0) {
+          await tx.table<GaugeSurvey, string>('gaugeSurveys').bulkPut(backfilled)
+        }
+        const allSurveys = [...existingSurveys, ...backfilled]
+
+        // 关系点据按测流当时零点折到统一基面；对不上时间的挑出来
+        const folded = foldRatings(oldRatings, allSurveys)
+        const foldMap = new Map(folded.map((item) => [item.ratingId, item]))
+        await tx
+          .table<Rating, string>('ratings')
+          .toCollection()
+          .modify((row: Rating) => {
+            const result = foldMap.get(row.id)
+            if (result && !result.unmatched) {
+              row.datumStageM = result.datumStageM
+              row.zeroSurveyId = result.surveyId
+              row.datumStatus = 'folded'
+            } else {
+              row.datumStageM = null
+              row.zeroSurveyId = null
+              row.datumStatus = 'unmatched'
+            }
+            row.updatedAt = now
+          })
+
+        // 旧有定线一律视为未定案：挂上重算任务，由资料室在资料侧重算/重试
+        const lineTable = tx.table<RatingLineState, string>('ratingLineStates')
+        const jobTable = tx.table<RecalcJob, string>('recalcJobs')
+        const lineNos = Array.from(new Set(oldRatings.map((rating) => rating.lineNo)))
+        const states: RatingLineState[] = []
+        const jobs: RecalcJob[] = []
+        lineNos.forEach((lineNo, index) => {
+          const stationId = oldRatings.find((rating) => rating.lineNo === lineNo)?.stationId ?? ''
+          states.push({
+            id: createId('rls'),
+            lineNo,
+            stationId,
+            status: 'draft',
+            lastSurveyAt: null,
+            needsRecalc: true,
+            lastRecalcAt: null,
+            createdAt: now,
+            updatedAt: now
+          })
+          jobs.push({
+            id: createId('job'),
+            lineNo,
+            stationId,
+            reason: '手动重算',
+            status: 'pending',
+            attempts: 0,
+            errorMessage: '',
+            forceFailOnce: false,
+            createdAt: now + index,
+            updatedAt: now + index,
+            lastTriedAt: null,
+            succeededAt: null
+          })
+        })
+        if (states.length > 0) await lineTable.bulkPut(states)
+        if (jobs.length > 0) await jobTable.bulkPut(jobs)
       })
   }
 }
@@ -269,27 +362,163 @@ export async function seedDemoData(): Promise<void> {
     }
   ]
 
-  // 水位流量关系点据：A 线为龙门站主定线，B 线为青矶站定线
+  // 水尺接测记录（站上）：
+  // - 龙门站洪水（8/15）后零点下沉 0.05 m：8/21 那次点据采用新零点，其余用旧零点；
+  // - 白沙滩只有 8/1 一条接测，5～7 月的点据时间对不上，演示「挑出来交站上认」。
+  const surveySeeds: Array<Omit<GaugeSurvey, 'createdAt' | 'updatedAt'>> = [
+    {
+      id: 'gsv_lh_old',
+      stationId: 'stn_lh01',
+      gaugeCode: 'P1',
+      surveyedAt: '2024-01-01T00:00:00.000Z',
+      zeroElevationM: 0,
+      operator: '秦越',
+      remark: '年度校测，零点稳定',
+      backfilled: false
+    },
+    {
+      id: 'gsv_lh_flood',
+      stationId: 'stn_lh01',
+      gaugeCode: 'P1',
+      surveyedAt: '2024-08-15T00:00:00.000Z',
+      zeroElevationM: -0.05,
+      operator: '秦越',
+      remark: '洪水后水尺重新接测，零点下沉 0.05 m',
+      backfilled: false
+    },
+    {
+      id: 'gsv_qj_old',
+      stationId: 'stn_qj02',
+      gaugeCode: 'P1',
+      surveyedAt: '2023-01-01T00:00:00.000Z',
+      zeroElevationM: 0,
+      operator: '何岩',
+      remark: '年度校测',
+      backfilled: false
+    },
+    {
+      id: 'gsv_bs_old',
+      stationId: 'stn_bs03',
+      gaugeCode: 'P1',
+      surveyedAt: '2024-06-01T00:00:00.000Z',
+      zeroElevationM: 0.02,
+      operator: '何岩',
+      remark: '汛前接测，零点偏高 0.02 m',
+      backfilled: false
+    },
+    {
+      id: 'gsv_bs_aug',
+      stationId: 'stn_bs03',
+      gaugeCode: 'P1',
+      surveyedAt: '2024-08-01T00:00:00.000Z',
+      zeroElevationM: 0,
+      operator: '何岩',
+      remark: '洪水季前接测',
+      backfilled: false
+    }
+  ]
+
+  // 水位流量关系点据：A 线为龙门站主定线，B 线为青矶站定线。
+  // datumStageM 为按测流当时零点折算到统一基面的水位（站上原始读数 stageM 保留不动）。
   const ratingSeeds: Array<Omit<Rating, 'createdAt' | 'updatedAt'>> = [
-    { id: 'rat_lh_a1', stationId: 'stn_lh01', stageM: 4.01, flowM3s: 97.5, lineNo: 'A', measureNo: '2024-04-001', measuredAt: '2024-04-08T08:00:00.000Z' },
-    { id: 'rat_lh_a2', stationId: 'stn_lh01', stageM: 4.52, flowM3s: 138.7, lineNo: 'A', measureNo: '2024-05-002', measuredAt: '2024-05-16T08:00:00.000Z' },
-    { id: 'rat_lh_a3', stationId: 'stn_lh01', stageM: 5.42, flowM3s: 217.2, lineNo: 'A', measureNo: '2024-06-001', measuredAt: '2024-06-12T08:30:00.000Z' },
-    { id: 'rat_lh_a4', stationId: 'stn_lh01', stageM: 6.15, flowM3s: 298.5, lineNo: 'A', measureNo: '2024-07-002', measuredAt: '2024-07-18T09:10:00.000Z' },
-    { id: 'rat_lh_a5', stationId: 'stn_lh01', stageM: 7.03, flowM3s: 428.1, lineNo: 'A', measureNo: '2024-08-006', measuredAt: '2024-08-21T08:20:00.000Z' },
-    { id: 'rat_qj_b1', stationId: 'stn_qj02', stageM: 2.84, flowM3s: 42.3, lineNo: 'B', measureNo: '2023-05-001', measuredAt: '2023-05-11T07:30:00.000Z' },
-    { id: 'rat_qj_b2', stationId: 'stn_qj02', stageM: 3.18, flowM3s: 56.1, lineNo: 'B', measureNo: '2024-05-003', measuredAt: '2024-05-22T07:50:00.000Z' },
-    { id: 'rat_qj_b3', stationId: 'stn_qj02', stageM: 3.72, flowM3s: 78.4, lineNo: 'B', measureNo: '2024-07-001', measuredAt: '2024-07-02T08:10:00.000Z' },
-    { id: 'rat_qj_b4', stationId: 'stn_qj02', stageM: 4.36, flowM3s: 115.6, lineNo: 'B', measureNo: '2024-08-004', measuredAt: '2024-08-09T06:40:00.000Z' },
-    // C 线：含两个明显偏离点，用于演示超限挂红与偏差分析
-    { id: 'rat_bs_c1', stationId: 'stn_bs03', stageM: 4.9, flowM3s: 168.0, lineNo: 'C', measureNo: '2024-05-004', measuredAt: '2024-05-28T09:00:00.000Z' },
-    { id: 'rat_bs_c2', stationId: 'stn_bs03', stageM: 5.36, flowM3s: 203.5, lineNo: 'C', measureNo: '2024-06-005', measuredAt: '2024-06-20T10:05:00.000Z' },
-    { id: 'rat_bs_c3', stationId: 'stn_bs03', stageM: 5.88, flowM3s: 325.0, lineNo: 'C', measureNo: '2024-07-007', measuredAt: '2024-07-25T09:30:00.000Z' },
-    { id: 'rat_bs_c4', stationId: 'stn_bs03', stageM: 6.44, flowM3s: 288.0, lineNo: 'C', measureNo: '2024-08-008', measuredAt: '2024-08-15T09:40:00.000Z' }
+    { id: 'rat_lh_a1', stationId: 'stn_lh01', stageM: 4.01, flowM3s: 97.5, lineNo: 'A', measureNo: '2024-04-001', measuredAt: '2024-04-08T08:00:00.000Z', datumStageM: 4.01, zeroSurveyId: 'gsv_lh_old', datumStatus: 'folded' },
+    { id: 'rat_lh_a2', stationId: 'stn_lh01', stageM: 4.52, flowM3s: 138.7, lineNo: 'A', measureNo: '2024-05-002', measuredAt: '2024-05-16T08:00:00.000Z', datumStageM: 4.52, zeroSurveyId: 'gsv_lh_old', datumStatus: 'folded' },
+    { id: 'rat_lh_a3', stationId: 'stn_lh01', stageM: 5.42, flowM3s: 217.2, lineNo: 'A', measureNo: '2024-06-001', measuredAt: '2024-06-12T08:30:00.000Z', datumStageM: 5.42, zeroSurveyId: 'gsv_lh_old', datumStatus: 'folded' },
+    { id: 'rat_lh_a4', stationId: 'stn_lh01', stageM: 6.15, flowM3s: 298.5, lineNo: 'A', measureNo: '2024-07-002', measuredAt: '2024-07-18T09:10:00.000Z', datumStageM: 6.15, zeroSurveyId: 'gsv_lh_old', datumStatus: 'folded' },
+    { id: 'rat_lh_a5', stationId: 'stn_lh01', stageM: 7.03, flowM3s: 428.1, lineNo: 'A', measureNo: '2024-08-006', measuredAt: '2024-08-21T08:20:00.000Z', datumStageM: 6.98, zeroSurveyId: 'gsv_lh_flood', datumStatus: 'folded' },
+    { id: 'rat_qj_b1', stationId: 'stn_qj02', stageM: 2.84, flowM3s: 42.3, lineNo: 'B', measureNo: '2023-05-001', measuredAt: '2023-05-11T07:30:00.000Z', datumStageM: 2.84, zeroSurveyId: 'gsv_qj_old', datumStatus: 'folded' },
+    { id: 'rat_qj_b2', stationId: 'stn_qj02', stageM: 3.18, flowM3s: 56.1, lineNo: 'B', measureNo: '2024-05-003', measuredAt: '2024-05-22T07:50:00.000Z', datumStageM: 3.18, zeroSurveyId: 'gsv_qj_old', datumStatus: 'folded' },
+    { id: 'rat_qj_b3', stationId: 'stn_qj02', stageM: 3.72, flowM3s: 78.4, lineNo: 'B', measureNo: '2024-07-001', measuredAt: '2024-07-02T08:10:00.000Z', datumStageM: 3.72, zeroSurveyId: 'gsv_qj_old', datumStatus: 'folded' },
+    { id: 'rat_qj_b4', stationId: 'stn_qj02', stageM: 4.36, flowM3s: 115.6, lineNo: 'B', measureNo: '2024-08-004', measuredAt: '2024-08-09T06:40:00.000Z', datumStageM: 4.36, zeroSurveyId: 'gsv_qj_old', datumStatus: 'folded' },
+    // C 线：含两个明显偏离点，用于演示超限挂红与偏差分析；前 3 点早于该站首条接测，时间对不上
+    { id: 'rat_bs_c1', stationId: 'stn_bs03', stageM: 4.9, flowM3s: 168.0, lineNo: 'C', measureNo: '2024-05-004', measuredAt: '2024-05-28T09:00:00.000Z', datumStageM: null, zeroSurveyId: null, datumStatus: 'unmatched' },
+    { id: 'rat_bs_c2', stationId: 'stn_bs03', stageM: 5.36, flowM3s: 203.5, lineNo: 'C', measureNo: '2024-06-005', measuredAt: '2024-06-20T10:05:00.000Z', datumStageM: 5.38, zeroSurveyId: 'gsv_bs_old', datumStatus: 'folded' },
+    { id: 'rat_bs_c3', stationId: 'stn_bs03', stageM: 5.88, flowM3s: 325.0, lineNo: 'C', measureNo: '2024-07-007', measuredAt: '2024-07-25T09:30:00.000Z', datumStageM: 5.9, zeroSurveyId: 'gsv_bs_old', datumStatus: 'folded' },
+    { id: 'rat_bs_c4', stationId: 'stn_bs03', stageM: 6.44, flowM3s: 288.0, lineNo: 'C', measureNo: '2024-08-008', measuredAt: '2024-08-15T09:40:00.000Z', datumStageM: 6.44, zeroSurveyId: 'gsv_bs_aug', datumStatus: 'folded' }
+  ]
+
+  /** 构造报出版本快照：冻结给定点据（已折基面）下的定线参数与逐点比测结论 */
+  function buildVersionSnapshot(
+    versionNo: string,
+    members: Array<Omit<Rating, 'createdAt' | 'updatedAt'>>,
+    note: string,
+    operator: string,
+    publishedAt: string
+  ): RatingVersion {
+    const fit = fitPowerCurve(
+      members.map((rating) => ({ stageM: rating.datumStageM ?? rating.stageM, flowM3s: rating.flowM3s })),
+      members[0]?.lineNo ?? ''
+    )
+    const points: RatingVersion['points'] = members.map((rating) => {
+      const datumStage = rating.datumStageM ?? rating.stageM
+      const predicted = fit.valid
+        ? round(fit.a * Math.pow(Math.max(datumStage - fit.h0, 1e-6), fit.b), 2)
+        : rating.flowM3s
+      const deviationPct = calcDeviationPct(rating.flowM3s, predicted)
+      return {
+        ratingId: rating.id,
+        stationId: rating.stationId,
+        measureNo: rating.measureNo,
+        measuredAt: rating.measuredAt,
+        surveyId: rating.zeroSurveyId,
+        stageM: rating.stageM,
+        datumStageM: datumStage,
+        flowM3s: rating.flowM3s,
+        curveFlowM3s: predicted,
+        deviationPct,
+        verdict: judgeDeviation(deviationPct)
+      }
+    })
+    const overLimitCount = points.filter((point) => point.verdict === '超限').length
+    return {
+      id: `ver_${versionNo.toLowerCase()}`,
+      lineNo: members[0]?.lineNo ?? '',
+      stationId: members[0]?.stationId ?? '',
+      versionNo,
+      fit,
+      points,
+      compareCount: points.length,
+      overLimitCount,
+      qualifyRatePct: points.length === 0 ? 0 : Number((((points.length - overLimitCount) / points.length) * 100).toFixed(1)),
+      note,
+      operator,
+      publishedAt,
+      createdAt: now
+    }
+  }
+
+  // A 线报出版本用的是洪水接测（8/15）之前的 4 个点：零点变化后旧版仍原样可查
+  const versionSeeds: RatingVersion[] = [
+    buildVersionSnapshot(
+      'A-V1',
+      ratingSeeds.filter((rating) => rating.lineNo === 'A' && rating.id !== 'rat_lh_a5'),
+      '汛中初定，按洪水接测前旧零点读数定线并报出',
+      '林昭',
+      '2024-08-10T12:00:00.000Z'
+    ),
+    buildVersionSnapshot(
+      'B-V1',
+      ratingSeeds.filter((rating) => rating.lineNo === 'B'),
+      '青矶站年度定线报出',
+      '林昭',
+      '2024-08-12T12:00:00.000Z'
+    )
   ]
 
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [
+      db.stations,
+      db.sections,
+      db.verticals,
+      db.points,
+      db.ratings,
+      db.compares,
+      db.gaugeSurveys,
+      db.ratingLineStates,
+      db.ratingVersions,
+      db.recalcJobs
+    ],
     async () => {
       const stamp = (row: { id: string }): { createdAt: number; updatedAt: number } => ({
         createdAt: now + row.id.length,
@@ -315,19 +544,23 @@ export async function seedDemoData(): Promise<void> {
         )
       )
       await db.ratings.bulkPut(ratingSeeds.map((rating) => ({ ...rating, ...stamp(rating) })))
+      await db.gaugeSurveys.bulkPut(surveySeeds.map((survey) => ({ ...survey, ...stamp(survey) })))
 
-      // 比测记录：按定线拟合出曲线流量后计算偏差与判定，保证与页面展示一致
+      // 比测记录：按「统一基面水位」拟合曲线流量后计算偏差与判定；
+      // 时间对不上、站上未确认的点据不参与比测，等站上认了零点随重算补入。
       const compares: Compare[] = []
+      const foldedSeeds = ratingSeeds.filter((rating) => rating.datumStatus === 'folded')
       const lineGroups = new Map<string, Array<{ stageM: number; flowM3s: number }>>()
-      ratingSeeds.forEach((rating) => {
+      foldedSeeds.forEach((rating) => {
         const list = lineGroups.get(rating.lineNo) ?? []
-        list.push({ stageM: rating.stageM, flowM3s: rating.flowM3s })
+        list.push({ stageM: rating.datumStageM ?? rating.stageM, flowM3s: rating.flowM3s })
         lineGroups.set(rating.lineNo, list)
       })
-      ratingSeeds.forEach((rating) => {
+      foldedSeeds.forEach((rating) => {
         const fit = fitPowerCurve(lineGroups.get(rating.lineNo) ?? [], rating.lineNo)
         if (!fit.valid) return
-        const predicted = round(fit.a * Math.pow(Math.max(rating.stageM - fit.h0, 1e-6), fit.b), 2)
+        const datumStage = rating.datumStageM ?? rating.stageM
+        const predicted = round(fit.a * Math.pow(Math.max(datumStage - fit.h0, 1e-6), fit.b), 2)
         const deviationPct = calcDeviationPct(rating.flowM3s, predicted)
         compares.push({
           id: `cmp_${rating.id}`,
@@ -343,20 +576,62 @@ export async function seedDemoData(): Promise<void> {
         })
       })
       await db.compares.bulkPut(compares)
-      if (compares.length === 0) {
-        await db.compares.put({
-          id: 'cmp_fallback',
-          ratingId: 'rat_lh_a1',
-          measuredFlow: 97.5,
-          curveFlow: 100.2,
-          deviationPct: calcDeviationPct(97.5, 100.2),
-          verdict: judgeDeviation(calcDeviationPct(97.5, 100.2)),
-          operator: '林昭',
-          comparedAt: iso,
+
+      // 定线状态：A 线洪水接测后未定案、待按新零点重算；B 已定案；C 未定案（待站上认点后重算）
+      const lineStates: RatingLineState[] = [
+        {
+          id: 'rls_a',
+          lineNo: 'A',
+          stationId: 'stn_lh01',
+          status: 'draft',
+          lastSurveyAt: '2024-08-15T00:00:00.000Z',
+          needsRecalc: true,
+          lastRecalcAt: null,
           createdAt: now,
           updatedAt: now
-        })
+        },
+        {
+          id: 'rls_b',
+          lineNo: 'B',
+          stationId: 'stn_qj02',
+          status: 'finalized',
+          lastSurveyAt: '2023-01-01T00:00:00.000Z',
+          needsRecalc: false,
+          lastRecalcAt: now,
+          createdAt: now,
+          updatedAt: now
+        },
+        {
+          id: 'rls_c',
+          lineNo: 'C',
+          stationId: 'stn_bs03',
+          status: 'draft',
+          lastSurveyAt: '2024-08-01T00:00:00.000Z',
+          needsRecalc: false,
+          lastRecalcAt: now,
+          createdAt: now,
+          updatedAt: now
+        }
+      ]
+      await db.ratingLineStates.bulkPut(lineStates)
+      await db.ratingVersions.bulkPut(versionSeeds)
+
+      // A 线的待办：零点改动后未定案定线的重算任务（资料室侧执行，失败可从这里重试）
+      const jobA: RecalcJob = {
+        id: 'job_a_recalc',
+        lineNo: 'A',
+        stationId: 'stn_lh01',
+        reason: '零点接测生效',
+        status: 'pending',
+        attempts: 0,
+        errorMessage: '',
+        forceFailOnce: false,
+        createdAt: now,
+        updatedAt: now,
+        lastTriedAt: null,
+        succeededAt: null
       }
+      await db.recalcJobs.put(jobA)
     }
   )
 }
@@ -375,7 +650,18 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [
+      db.stations,
+      db.sections,
+      db.verticals,
+      db.points,
+      db.ratings,
+      db.compares,
+      db.gaugeSurveys,
+      db.ratingLineStates,
+      db.ratingVersions,
+      db.recalcJobs
+    ],
     async () => {
       await Promise.all([
         db.stations.clear(),
@@ -383,7 +669,11 @@ export async function clearAllTables(): Promise<void> {
         db.verticals.clear(),
         db.points.clear(),
         db.ratings.clear(),
-        db.compares.clear()
+        db.compares.clear(),
+        db.gaugeSurveys.clear(),
+        db.ratingLineStates.clear(),
+        db.ratingVersions.clear(),
+        db.recalcJobs.clear()
       ])
     }
   )
@@ -397,15 +687,30 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与导出页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
+  const [
+    stations,
+    sections,
+    verticals,
+    points,
+    ratings,
+    compares,
+    gaugeSurveys,
+    ratingLineStates,
+    ratingVersions,
+    recalcJobs
+  ] = await Promise.all([
     db.stations.count(),
     db.sections.count(),
     db.verticals.count(),
     db.points.count(),
     db.ratings.count(),
-    db.compares.count()
+    db.compares.count(),
+    db.gaugeSurveys.count(),
+    db.ratingLineStates.count(),
+    db.ratingVersions.count(),
+    db.recalcJobs.count()
   ])
-  return { stations, sections, verticals, points, ratings, compares }
+  return { stations, sections, verticals, points, ratings, compares, gaugeSurveys, ratingLineStates, ratingVersions, recalcJobs }
 }
 
 /** 写入结构版本号到 localStorage，便于导出页比对 */

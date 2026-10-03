@@ -3,19 +3,32 @@ export interface Rating {
   id: string
   /** 所属测站 */
   stationId: string
-  /** 水位（m） */
-  stageM: number
   /** 流量（m³/s） */
   flowM3s: number
   /** 定线号：同一定线号的点据参与同一组拟合 */
   lineNo: string
   /** 点据来源测次号 */
   measureNo: string
-  /** 点据时间 */
+  /** 点据时间（取测流当时，用于匹配当时生效的水尺零点） */
   measuredAt: string
+  /** 水尺读数（m，站上原始读数，任何折算都不改它） */
+  stageM: number
+  /**
+   * 统一基面水位（m）= 水尺读数 + 测流当时生效接测的零点高程。
+   * 资料室定线、比测一律用本字段；对不上时间、站上未确认前为 null。
+   */
+  datumStageM: number | null
+  /** 折算所采用的接测记录 id；对不上时间时为 null */
+  zeroSurveyId: string | null
+  /** 基面状态：unmatched 表示时间对不上、已挑出交站上确认 */
+  datumStatus: 'folded' | 'unmatched'
   createdAt: number
   updatedAt: number
 }
+
+/** 新增点据入参：基面折算由资料室重算补，录入时只给读数 */
+export type RatingInput = Omit<Rating, 'id' | 'createdAt' | 'updatedAt' | 'datumStageM' | 'zeroSurveyId' | 'datumStatus'> &
+  Partial<Pick<Rating, 'datumStageM' | 'zeroSurveyId' | 'datumStatus'>>
 
 /** 幂函数定线结果：Q = a * (H - H0)^b */
 export interface RatingFitResult {

@@ -77,8 +77,8 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
   const allFits = computed<RatingFitResult[]>(() =>
     lineNos.value.map((lineNo) => {
       const points = ratings.value
-        .filter((rating) => rating.lineNo === lineNo)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s }))
+        .filter((rating) => rating.lineNo === lineNo && rating.datumStatus === 'folded')
+        .map((rating) => ({ stageM: rating.datumStageM ?? rating.stageM, flowM3s: rating.flowM3s }))
       return fitPowerCurve(points, lineNo)
     })
   )
@@ -93,11 +93,13 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
     const current = fit.value
     return ratings.value
       .filter((rating) => rating.lineNo === activeLineNo.value)
-      .sort((a, b) => a.stageM - b.stageM)
+      .sort((a, b) => (a.datumStageM ?? a.stageM) - (b.datumStageM ?? b.stageM))
       .map((rating) => {
-        const predicted = current.valid ? curveFlow(current, rating.stageM) : 0
+        const datumStage = rating.datumStageM ?? rating.stageM
+        const folded = rating.datumStatus === 'folded'
+        const predicted = current.valid && folded ? curveFlow(current, datumStage) : 0
         const residualPct =
-          current.valid && rating.flowM3s > 0
+          current.valid && folded && rating.flowM3s > 0
             ? Number((((rating.flowM3s - predicted) / rating.flowM3s) * 100).toFixed(2))
             : 0
         return {
@@ -112,9 +114,9 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
 
   const curveSamples = computed<CurveSample[]>(() => {
     const current = fit.value
-    const rows = pointRows.value
+    const rows = pointRows.value.filter((row) => row.rating.datumStatus === 'folded')
     if (!current.valid || rows.length === 0) return []
-    const stages = rows.map((row) => row.rating.stageM)
+    const stages = rows.map((row) => row.rating.datumStageM ?? row.rating.stageM)
     const min = Math.min(...stages)
     const max = Math.max(...stages)
     const step = (max - min) / 12 || 0.1
@@ -128,9 +130,10 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
     const limit = ratingStore.deviationLimitPct
     return allFits.value.flatMap((item) =>
       ratings.value
-        .filter((rating) => rating.lineNo === item.lineNo)
+        .filter((rating) => rating.lineNo === item.lineNo && rating.datumStatus === 'folded')
         .map((rating) => {
-          const predicted = item.valid ? curveFlow(item, rating.stageM) : 0
+          const datumStage = rating.datumStageM ?? rating.stageM
+          const predicted = item.valid ? curveFlow(item, datumStage) : 0
           const residualPct =
             item.valid && rating.flowM3s > 0
               ? Number((((rating.flowM3s - predicted) / rating.flowM3s) * 100).toFixed(2))
@@ -157,11 +160,9 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
 
   function refit(): RatingFitResult {
     const points = ratings.value
-      .filter((rating) => rating.lineNo === activeLineNo.value)
-      .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s }))
-    const result = fitPowerCurve(points, activeLineNo.value)
-    ratingStore.setFit(result)
-    return result
+      .filter((rating) => rating.lineNo === activeLineNo.value && rating.datumStatus === 'folded')
+      .map((rating) => ({ stageM: rating.datumStageM ?? rating.stageM, flowM3s: rating.flowM3s }))
+    return fitPowerCurve(points, activeLineNo.value)
   }
 
   return {

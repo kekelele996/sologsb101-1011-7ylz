@@ -5,22 +5,30 @@
  */
 import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DataLine, Files, Histogram, Odometer, PieChart, TrendCharts } from '@element-plus/icons-vue'
+import { DataLine, Files, Histogram, Odometer, PieChart, TrendCharts, Aim, SetUp } from '@element-plus/icons-vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import { useRatingStore } from '@/stores/ratingStore'
-import { DB_NAME, DB_VERSION } from '@/utils/db'
+import { useSurveyStore } from '@/stores/surveyStore'
+import { useDatumStore } from '@/stores/datumStore'
+import { DB_NAME, DB_VERSION, initDatabase } from '@/utils/db'
 
 const route = useRoute()
 const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
 const ratingStore = useRatingStore()
+const surveyStore = useSurveyStore()
+const datumStore = useDatumStore()
 
 onMounted(() => {
   stationStore.start()
   sectionStore.start()
   ratingStore.start()
+  surveyStore.start()
+  datumStore.start()
+  // 待处理重算（如旧数据升级、站上新登记接测后挂的任务）自动执行；失败任务须在资料室页显式重试
+  void initDatabase().then(() => datumStore.runPending())
 })
 
 /** 层级路由统一归属到最上层导航项 */
@@ -33,7 +41,9 @@ const activeKey = computed(() => {
 
 const navItems = computed(() => [
   { key: '/stations', label: '测站台账', icon: Odometer, badge: String(stationStore.stations.length) },
-  { key: '/ratings', label: '关系点据与定线', icon: TrendCharts, badge: String(ratingStore.ratings.length) },
+  { key: '/surveys', label: '水尺接测·站上', icon: Aim, badge: String(surveyStore.unmatchedRatings.length || '') },
+  { key: '/ratings', label: '关系点据', icon: TrendCharts, badge: String(ratingStore.ratings.length) },
+  { key: '/datum-room', label: '基面定线·资料室', icon: SetUp, badge: String(datumStore.failedJobs.length || '') },
   { key: '/export', label: '比测与导出', icon: PieChart, badge: String(ratingStore.overLimitRows.length) }
 ])
 
@@ -43,6 +53,7 @@ const contextLinks = computed(() => {
   const stationId = route.params.id as string | undefined
   if (route.path.startsWith('/stations/') && stationId) {
     links.push({ label: '该站断面测次', path: `/stations/${stationId}/sections` })
+    links.push({ label: '该站水尺接测', path: `/surveys?station=${stationId}` })
   }
   if (route.path.startsWith('/sections/') && stationId) {
     const section = sectionStore.sectionById(stationId)
@@ -53,7 +64,13 @@ const contextLinks = computed(() => {
     const vertical = sectionStore.verticals.find((item) => item.id === stationId)
     if (vertical) links.push({ label: '所属断面垂线', path: `/sections/${vertical.sectionId}/verticals` })
   }
-  if (route.path.startsWith('/ratings')) links.push({ label: '比测分析', path: '/export' })
+  if (route.path.startsWith('/ratings')) {
+    links.push({ label: '站上水尺接测', path: '/surveys' })
+    links.push({ label: '资料室基面定线', path: '/datum-room' })
+    links.push({ label: '比测分析', path: '/export' })
+  }
+  if (route.path.startsWith('/datum-room')) links.push({ label: '站上接测登记', path: '/surveys' })
+  if (route.path.startsWith('/surveys')) links.push({ label: '资料室定线室', path: '/datum-room' })
   if (route.path.startsWith('/export')) links.push({ label: '关系点据', path: '/ratings' })
   return links
 })
@@ -116,7 +133,8 @@ function go(path: string): void {
       <span>
         测站 {{ stationStore.stations.length }} · 测次 {{ sectionStore.sections.length }} · 垂线
         {{ sectionStore.verticals.length }} · 测点 {{ sectionStore.points.length }} · 点据
-        {{ ratingStore.ratings.length }}
+        {{ ratingStore.ratings.length }} · 接测 {{ surveyStore.surveys.length }} · 报出版本
+        {{ datumStore.versions.length }}
       </span>
     </footer>
   </div>
