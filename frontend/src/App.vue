@@ -5,10 +5,11 @@
  */
 import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DataLine, Files, Histogram, Odometer, PieChart, TrendCharts } from '@element-plus/icons-vue'
+import { DataLine, Files, Histogram, Odometer, PieChart, SetUp, TrendCharts } from '@element-plus/icons-vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import { useRatingStore } from '@/stores/ratingStore'
+import { useGaugeSurveyStore } from '@/stores/gaugeSurveyStore'
 import { DB_NAME, DB_VERSION } from '@/utils/db'
 
 const route = useRoute()
@@ -16,11 +17,13 @@ const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
 const ratingStore = useRatingStore()
+const gaugeStore = useGaugeSurveyStore()
 
 onMounted(() => {
   stationStore.start()
   sectionStore.start()
   ratingStore.start()
+  gaugeStore.start()
 })
 
 /** 层级路由统一归属到最上层导航项 */
@@ -28,11 +31,13 @@ const activeKey = computed(() => {
   if (route.path.startsWith('/stations/')) return '/stations'
   if (route.path.startsWith('/sections/')) return '/stations'
   if (route.path.startsWith('/verticals/')) return '/stations'
+  if (route.path.startsWith('/gauges')) return '/gauges'
   return route.path
 })
 
 const navItems = computed(() => [
   { key: '/stations', label: '测站台账', icon: Odometer, badge: String(stationStore.stations.length) },
+  { key: '/gauges', label: '水尺接测(站上)', icon: SetUp, badge: String(gaugeStore.surveys.length) },
   { key: '/ratings', label: '关系点据与定线', icon: TrendCharts, badge: String(ratingStore.ratings.length) },
   { key: '/export', label: '比测与导出', icon: PieChart, badge: String(ratingStore.overLimitRows.length) }
 ])
@@ -54,6 +59,8 @@ const contextLinks = computed(() => {
     if (vertical) links.push({ label: '所属断面垂线', path: `/sections/${vertical.sectionId}/verticals` })
   }
   if (route.path.startsWith('/ratings')) links.push({ label: '比测分析', path: '/export' })
+  if (route.path.startsWith('/ratings')) links.push({ label: '站上水尺接测', path: '/gauges' })
+  if (route.path.startsWith('/gauges')) links.push({ label: '关系点据定线', path: '/ratings' })
   if (route.path.startsWith('/export')) links.push({ label: '关系点据', path: '/ratings' })
   return links
 })
@@ -114,7 +121,7 @@ function go(path: string): void {
         本地库 {{ DB_NAME }} · 结构版本 v{{ DB_VERSION }} · 数据仅存于本浏览器 IndexedDB，不上传任何服务器。
       </span>
       <span>
-        测站 {{ stationStore.stations.length }} · 测次 {{ sectionStore.sections.length }} · 垂线
+        测站 {{ stationStore.stations.length }} · 接测 {{ gaugeStore.surveys.length }} · 测次 {{ sectionStore.sections.length }} · 垂线
         {{ sectionStore.verticals.length }} · 测点 {{ sectionStore.points.length }} · 点据
         {{ ratingStore.ratings.length }}
       </span>

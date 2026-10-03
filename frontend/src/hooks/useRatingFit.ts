@@ -1,6 +1,8 @@
 /**
- * useRatingFit：水位流量点据拟合、残差与定线状态管理。
+ * useRatingFit：水位流量点据拟合、残差与定线状态管理（统一基面口径）。
  * 被关系点据页与导出页消费；点据数据来自 ratingStore（IndexedDB 实时订阅）。
+ * 点据水位一律取 datumStageM（按测流当时那次零点折到同一基面），
+ * datumStatus=pending（待站上认）的点据不参与定线。
  */
 import { computed, ref, type ComputedRef, type Ref } from 'vue'
 import { storeToRefs } from 'pinia'
@@ -8,12 +10,12 @@ import { useRatingStore } from '@/stores/ratingStore'
 import type { Compare } from '@/types/compare'
 import {
   curveFlow,
-  fitPowerCurve,
+  fitRatingsOnDatum,
   type Rating,
   type RatingFitResult
 } from '@/types/rating'
 
-/** 曲线采样点（用于关系曲线绘制） */
+/** 曲线采样点（用于关系曲线绘制，坐标为统一基面水位） */
 export interface CurveSample {
   stageM: number
   flowM3s: number
@@ -47,19 +49,19 @@ export interface UseRatingFitResult {
   curveSamples: ComputedRef<CurveSample[]>
   /** 超限点据清单 */
   overLimitRows: ComputedRef<RatingPointRow[]>
-  /** 超限点据对应的比测记录 */
+  /** 超限点据对应的工作版比测记录 */
   overLimitCompares: ComputedRef<Compare[]>
   setActiveLine: (lineNo: string) => void
-  /** 按当前点据重算定线参数并回写 store */
-  refit: () => RatingFitResult
+  /** 触发一次资料室基面重算并重取当前定线结果 */
+  refit: () => Promise<RatingFitResult>
 }
 
 /**
- * 组合式函数：按定线号分组拟合幂函数 Q = a×(H-H0)^b，并给出逐点残差。
+ * 组合式函数：按定线号分组、以统一基面水位拟合幂函数 Q = a×(H-H0)^b，并给出逐点残差。
  */
 export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
   const ratingStore = useRatingStore()
-  const { ratings, compares } = storeToRefs(ratingStore)
+  const { ratings, workingCompares } = storeToRefs(ratingStore)
   const activeLineNo = ref<string>(initialLineNo)
 
   const lineNos = computed<string[]>(() => {
@@ -75,27 +77,26 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
   }
 
   const allFits = computed<RatingFitResult[]>(() =>
-    lineNos.value.map((lineNo) => {
-      const points = ratings.value
-        .filter((rating) => rating.lineNo === lineNo)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s }))
-      return fitPowerCurve(points, lineNo)
-    })
+    lineNos.value.map((lineNo) => fitRatingsOnDatum(ratings.value, lineNo))
   )
 
   const fit = computed<RatingFitResult>(() => {
     const found = allFits.value.find((item) => item.lineNo === activeLineNo.value)
     if (found) return found
-    return fitPowerCurve([], activeLineNo.value)
+    return fitRatingsOnDatum([], activeLineNo.value)
   })
+
+  /** 参与定线的点据（剔除 pending），拟合坐标取 datumStageM */
+  const fittableOf = (lineNo: string): Rating[] =>
+    ratings.value.filter((rating) => rating.lineNo === lineNo && rating.datumStatus !== 'pending')
 
   const pointRows = computed<RatingPointRow[]>(() => {
     const current = fit.value
-    return ratings.value
-      .filter((rating) => rating.lineNo === activeLineNo.value)
-      .sort((a, b) => a.stageM - b.stageM)
+    return fittableOf(activeLineNo.value)
+      .sort((a, b) => (a.datumStageM ?? 0) - (b.datumStageM ?? 0))
       .map((rating) => {
-        const predicted = current.valid ? curveFlow(current, rating.stageM) : 0
+        const datumStage = rating.datumStageM ?? rating.stageM
+        const predicted = current.valid ? curveFlow(current, datumStage) : 0
         const residualPct =
           current.valid && rating.flowM3s > 0
             ? Number((((rating.flowM3s - predicted) / rating.flowM3s) * 100).toFixed(2))
@@ -114,12 +115,12 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
     const current = fit.value
     const rows = pointRows.value
     if (!current.valid || rows.length === 0) return []
-    const stages = rows.map((row) => row.rating.stageM)
+    const stages = rows.map((row) => row.rating.datumStageM ?? row.rating.stageM)
     const min = Math.min(...stages)
     const max = Math.max(...stages)
     const step = (max - min) / 12 || 0.1
     return Array.from({ length: 13 }, (_, index) => {
-      const stageM = Number((min + step * index).toFixed(2))
+      const stageM = Number((min + step * index).toFixed(3))
       return { stageM, flowM3s: curveFlow(current, stageM) }
     })
   })
@@ -127,10 +128,10 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
   const overLimitRows = computed<RatingPointRow[]>(() => {
     const limit = ratingStore.deviationLimitPct
     return allFits.value.flatMap((item) =>
-      ratings.value
-        .filter((rating) => rating.lineNo === item.lineNo)
+      fittableOf(item.lineNo)
         .map((rating) => {
-          const predicted = item.valid ? curveFlow(item, rating.stageM) : 0
+          const datumStage = rating.datumStageM ?? rating.stageM
+          const predicted = item.valid ? curveFlow(item, datumStage) : 0
           const residualPct =
             item.valid && rating.flowM3s > 0
               ? Number((((rating.flowM3s - predicted) / rating.flowM3s) * 100).toFixed(2))
@@ -148,25 +149,23 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
   })
 
   const overLimitCompares = computed<Compare[]>(() =>
-    compares.value.filter((compare) => compare.verdict === '超限')
+    workingCompares.value.filter((compare) => compare.verdict === '超限')
   )
 
   function setActiveLine(lineNo: string): void {
     activeLineNo.value = lineNo
+    ratingStore.setActiveLine(lineNo)
   }
 
-  function refit(): RatingFitResult {
-    const points = ratings.value
-      .filter((rating) => rating.lineNo === activeLineNo.value)
-      .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s }))
-    const result = fitPowerCurve(points, activeLineNo.value)
-    ratingStore.setFit(result)
-    return result
+  async function refit(): Promise<RatingFitResult> {
+    // 资料室侧重算（幂等，可重试）：重折基面 + 重算定线与工作版比测
+    await ratingStore.recomputeDatum()
+    return fitRatingsOnDatum(ratings.value, activeLineNo.value)
   }
 
   return {
     ratings,
-    compares,
+    compares: workingCompares,
     lineNos,
     activeLineNo,
     fit,

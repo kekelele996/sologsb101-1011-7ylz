@@ -13,7 +13,16 @@ import {
 } from '@/utils/db'
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['stations', 'sections', 'verticals', 'points', 'ratings', 'compares'] as const
+export const BACKUP_KEYS = [
+  'stations',
+  'sections',
+  'verticals',
+  'points',
+  'ratings',
+  'compares',
+  'gaugeSurveys',
+  'ratingVersions'
+] as const
 export type BackupKey = (typeof BACKUP_KEYS)[number]
 
 /** 各表行数统计（导出页展示与导入结果回执共用） */
@@ -21,14 +30,17 @@ export type CountMap = Record<BackupKey, number>
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
-    db.stations.toArray(),
-    db.sections.toArray(),
-    db.verticals.toArray(),
-    db.points.toArray(),
-    db.ratings.toArray(),
-    db.compares.toArray()
-  ])
+  const [stations, sections, verticals, points, ratings, compares, gaugeSurveys, ratingVersions] =
+    await Promise.all([
+      db.stations.toArray(),
+      db.sections.toArray(),
+      db.verticals.toArray(),
+      db.points.toArray(),
+      db.ratings.toArray(),
+      db.compares.toArray(),
+      db.gaugeSurveys.toArray(),
+      db.ratingVersions.toArray()
+    ])
   return {
     app: 'gbhydrogaug',
     dbVersion: DB_VERSION,
@@ -38,7 +50,9 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     verticals,
     points,
     ratings,
-    compares
+    compares,
+    gaugeSurveys,
+    ratingVersions
   }
 }
 
@@ -52,7 +66,9 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
   if (obj.app !== 'gbhydrogaug' && obj.app !== undefined) {
     errors.push('app 字段应为 gbhydrogaug，文件来源不明')
   }
-  for (const key of BACKUP_KEYS) {
+  // 六张原表为必需；v3 新增两表缺失时按空数组处理（兼容旧备份）
+  const requiredKeys: BackupKey[] = ['stations', 'sections', 'verticals', 'points', 'ratings', 'compares']
+  for (const key of requiredKeys) {
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`)
   }
   if (errors.length > 0) return { ok: false, errors, payload: null }
@@ -65,7 +81,9 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     verticals: obj.verticals ?? [],
     points: obj.points ?? [],
     ratings: obj.ratings ?? [],
-    compares: obj.compares ?? []
+    compares: obj.compares ?? [],
+    gaugeSurveys: Array.isArray(obj.gaugeSurveys) ? obj.gaugeSurveys : [],
+    ratingVersions: Array.isArray(obj.ratingVersions) ? obj.ratingVersions : []
   }
   return { ok: true, errors, payload }
 }
@@ -78,7 +96,9 @@ export function countPayload(payload: BackupPayload): CountMap {
     verticals: payload.verticals.length,
     points: payload.points.length,
     ratings: payload.ratings.length,
-    compares: payload.compares.length
+    compares: payload.compares.length,
+    gaugeSurveys: payload.gaugeSurveys.length,
+    ratingVersions: payload.ratingVersions.length
   }
 }
 
@@ -116,7 +136,16 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [
+      db.stations,
+      db.sections,
+      db.verticals,
+      db.points,
+      db.ratings,
+      db.compares,
+      db.gaugeSurveys,
+      db.ratingVersions
+    ],
     async () => {
       await db.stations.bulkPut(payload.stations)
       await db.sections.bulkPut(payload.sections)
@@ -124,6 +153,8 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
       await db.points.bulkPut(payload.points)
       await db.ratings.bulkPut(payload.ratings)
       await db.compares.bulkPut(payload.compares)
+      await db.gaugeSurveys.bulkPut(payload.gaugeSurveys)
+      await db.ratingVersions.bulkPut(payload.ratingVersions)
     }
   )
   return countPayload(payload)
@@ -135,6 +166,8 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   const sectionMap = new Map<string, string>()
   const verticalMap = new Map<string, string>()
   const ratingMap = new Map<string, string>()
+  const surveyMap = new Map<string, string>()
+  const versionMap = new Map<string, string>()
 
   const stations = payload.stations.map((station) => {
     const id = createId('stn')
@@ -156,17 +189,51 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('pnt'),
     verticalId: verticalMap.get(point.verticalId) ?? point.verticalId
   }))
+  const gaugeSurveys = payload.gaugeSurveys.map((survey) => {
+    const id = createId('gsv')
+    surveyMap.set(survey.id, id)
+    return { ...survey, id, stationId: stationMap.get(survey.stationId) ?? survey.stationId }
+  })
   const ratings = payload.ratings.map((rating) => {
     const id = createId('rat')
     ratingMap.set(rating.id, id)
-    return { ...rating, id, stationId: stationMap.get(rating.stationId) ?? rating.stationId }
+    return {
+      ...rating,
+      id,
+      stationId: stationMap.get(rating.stationId) ?? rating.stationId,
+      datumSurveyId: rating.datumSurveyId ? surveyMap.get(rating.datumSurveyId) ?? rating.datumSurveyId : null,
+      publishedVersionId: rating.publishedVersionId
+        ? versionMap.get(rating.publishedVersionId) ?? rating.publishedVersionId
+        : null
+    }
+  })
+  const ratingVersions = payload.ratingVersions.map((version) => {
+    const id = createId('ver')
+    versionMap.set(version.id, id)
+    return {
+      ...version,
+      id,
+      points: version.points.map((point) => ({
+        ...point,
+        ratingId: ratingMap.get(point.ratingId) ?? point.ratingId,
+        stationId: stationMap.get(point.stationId) ?? point.stationId,
+        datumSurveyId: point.datumSurveyId ? surveyMap.get(point.datumSurveyId) ?? point.datumSurveyId : null
+      })),
+      compares: version.compares.map((compare) => ({
+        ...compare,
+        ratingId: ratingMap.get(compare.ratingId) ?? compare.ratingId
+      }))
+    }
   })
   const compares = payload.compares.map((compare) => ({
     ...compare,
     id: createId('cmp'),
-    ratingId: ratingMap.get(compare.ratingId) ?? compare.ratingId
+    ratingId: ratingMap.get(compare.ratingId) ?? compare.ratingId,
+    ratingVersionId: compare.ratingVersionId
+      ? versionMap.get(compare.ratingVersionId) ?? compare.ratingVersionId
+      : null
   }))
-  return { ...payload, stations, sections, verticals, points, ratings, compares }
+  return { ...payload, stations, sections, verticals, points, ratings, compares, gaugeSurveys, ratingVersions }
 }
 
 /**
@@ -180,7 +247,11 @@ export interface ConclusionLine {
   sectionCount: number
   latestStageM: number | null
   ratingCount: number
+  /** 待站上认定零点的点据数 */
+  pendingCount: number
   overLimitCount: number
+  /** 已报出定线版本数 */
+  publishedVersionCount: number
   fitText: string
 }
 
@@ -196,8 +267,16 @@ export function buildConclusionLines(
     }, null)
     const ratings = payload.ratings.filter((rating) => rating.stationId === station.id)
     const ratingIds = new Set(ratings.map((rating) => rating.id))
+    // 当前结论只统计工作版比测（已报出版本的归档比测不计入现行合格率）
     const overLimitCount = payload.compares.filter(
-      (compare) => ratingIds.has(compare.ratingId) && compare.verdict === '超限'
+      (compare) =>
+        ratingIds.has(compare.ratingId) &&
+        compare.ratingVersionId === null &&
+        compare.verdict === '超限'
+    ).length
+    const pendingCount = ratings.filter((rating) => rating.datumStatus === 'pending').length
+    const publishedVersionCount = payload.ratingVersions.filter((version) =>
+      version.points.some((point) => point.stationId === station.id)
     ).length
     const lines = Array.from(new Set(ratings.map((rating) => rating.lineNo)))
     const fitParts = lines.map((lineNo) => {
@@ -212,7 +291,9 @@ export function buildConclusionLines(
       sectionCount: sections.length,
       latestStageM: latest,
       ratingCount: ratings.length,
+      pendingCount,
       overLimitCount,
+      publishedVersionCount,
       fitText: fitParts.length > 0 ? fitParts.join('；') : '暂无关系点据'
     }
   })

@@ -32,7 +32,7 @@ import {
   remapIds,
   validateBackup
 } from '@/utils/export'
-import { fitPowerCurve } from '@/types/rating'
+import { fitRatingsOnDatum } from '@/types/rating'
 
 const ratingStore = useRatingStore()
 const stationStore = useStationStore()
@@ -58,7 +58,9 @@ const conclusions = ref<
     sectionCount: number
     latestStageM: number | null
     ratingCount: number
+    pendingCount: number
     overLimitCount: number
+    publishedVersionCount: number
     fitText: string
   }>
 >([])
@@ -72,12 +74,7 @@ async function refreshCounts(): Promise<void> {
 async function buildConclusions(): Promise<void> {
   const payload = await buildBackupPayload()
   const fits = ratingStore.lineNos.map((lineNo) =>
-    fitPowerCurve(
-      payload.ratings
-        .filter((rating) => rating.lineNo === lineNo)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
-      lineNo
-    )
+    fitRatingsOnDatum(payload.ratings, lineNo)
   )
   conclusions.value = buildConclusionLines(payload, fits)
 }
@@ -149,10 +146,14 @@ async function handleReset(): Promise<void> {
 }
 
 async function refreshAll(): Promise<void> {
-  await ratingStore.rebuildCompares(ratingStore.activeLineNo)
+  try {
+    await ratingStore.recomputeDatum()
+  } catch {
+    ElMessage.error('基面重算失败，可再次点本按钮重试；站上水尺接测记录不受影响')
+  }
   await refreshCounts()
   await buildConclusions()
-  ElMessage.success('已重新定线并刷新结构版本信息')
+  ElMessage.success('已按当前接测零点重折基面、重算定线并刷新结构版本信息')
 }
 
 onMounted(() => {
@@ -201,28 +202,28 @@ onMounted(() => {
       </div>
       <el-table :data="conclusions" border class="gb-table-compact">
         <el-table-column prop="stationName" label="测站" min-width="140" />
-        <el-table-column prop="river" label="河名" width="110" />
-        <el-table-column label="测次数" width="90" align="right">
+        <el-table-column prop="river" label="河名" width="100" />
+        <el-table-column label="测次数" width="80" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.sectionCount }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="最新水位 (m)" width="130" align="right">
+        <el-table-column label="点据/待认" width="100" align="right">
           <template #default="{ row }">
-            <span class="gb-mono">{{ row.latestStageM === null ? '—' : row.latestStageM.toFixed(2) }}</span>
+            <span class="gb-mono">{{ row.ratingCount }} / <span :class="{ 'page__danger': row.pendingCount > 0 }">{{ row.pendingCount }}</span></span>
           </template>
         </el-table-column>
-        <el-table-column label="点据数" width="90" align="right">
-          <template #default="{ row }">
-            <span class="gb-mono">{{ row.ratingCount }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="超限" width="90" align="right">
+        <el-table-column label="超限" width="70" align="right">
           <template #default="{ row }">
             <span class="gb-mono" :class="{ 'page__danger': row.overLimitCount > 0 }">{{ row.overLimitCount }}</span>
           </template>
         </el-table-column>
-        <el-table-column prop="fitText" label="定线成果" min-width="320" show-overflow-tooltip />
+        <el-table-column label="报出版" width="70" align="right">
+          <template #default="{ row }">
+            <span class="gb-mono">{{ row.publishedVersionCount }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="fitText" label="定线成果（统一基面）" min-width="300" show-overflow-tooltip />
       </el-table>
     </el-card>
 
@@ -253,9 +254,9 @@ onMounted(() => {
             <el-tag size="small" effect="plain">{{ row.lineNo }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="水位 (m)" width="110" align="right">
+        <el-table-column label="基面水位 (m)" width="120" align="right">
           <template #default="{ row }">
-            <span class="gb-mono">{{ row.rating ? row.rating.stageM.toFixed(2) : '—' }}</span>
+            <span class="gb-mono">{{ row.rating && row.rating.datumStageM !== null ? row.rating.datumStageM.toFixed(3) : '—' }}</span>
           </template>
         </el-table-column>
         <el-table-column label="实测流量" width="130" align="right">
@@ -290,7 +291,7 @@ onMounted(() => {
       <div class="gb-panel-title">
         <h3>全量 JSON 导入导出</h3>
         <span class="gb-hint">
-          导出内容包含 stations / sections / verticals / points / ratings / compares 六张表
+          导出内容包含 stations / sections / verticals / points / ratings / compares / gaugeSurveys / ratingVersions 八张表
         </span>
       </div>
 
@@ -333,6 +334,9 @@ onMounted(() => {
         </el-descriptions-item>
         <el-descriptions-item label="点据 / 比测">
           {{ counts.ratings ?? 0 }} / {{ counts.compares ?? 0 }}
+        </el-descriptions-item>
+        <el-descriptions-item label="接测 / 报出版">
+          {{ counts.gaugeSurveys ?? 0 }} / {{ counts.ratingVersions ?? 0 }}
         </el-descriptions-item>
         <el-descriptions-item label="最近备份时间">
           {{ lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份' }}

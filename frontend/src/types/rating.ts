@@ -1,9 +1,14 @@
+import type { DatumStatus } from './gaugeSurvey'
+
 /** 水位流量关系点据：参与幂函数定线的实测点 */
 export interface Rating {
   id: string
   /** 所属测站 */
   stationId: string
-  /** 水位（m） */
+  /**
+   * 水尺读数（m，水尺零点起算，站上观测原值）。
+   * 旧字段 stageM 保留为兼容别名，两者始终同值。
+   */
   stageM: number
   /** 流量（m³/s） */
   flowM3s: number
@@ -13,6 +18,68 @@ export interface Rating {
   measureNo: string
   /** 点据时间 */
   measuredAt: string
+  /** 测流当时生效的水尺接测记录 id（无零点记录的旧数据为 null） */
+  datumSurveyId: string | null
+  /** 当时生效的零点高程（m）；折算基准，与 datumSurveyId 对应 */
+  datumZeroElevM: number | null
+  /** 折到统一基面后的水位（m）= 水尺读数 + 生效零点；资料室按它定线 */
+  datumStageM: number | null
+  /** 基面来源状态：已折算 / 回填零点 / 待站上认 */
+  datumStatus: DatumStatus
+  /** 基面折算说明（回填或对不上时间的原因） */
+  datumNote: string
+  /** 最近一次参与定线并发布的版本 id；null 表示零点改动后尚未重算定案 */
+  publishedVersionId: string | null
+  createdAt: number
+  updatedAt: number
+}
+
+/**
+ * 已报出的定线版本（资料室侧，只追加、不改写）。
+ * 零点改动后重算会生成新版本；旧版本连同当时的比测结论照样可查。
+ */
+export interface RatingVersion {
+  id: string
+  /** 定线号 */
+  lineNo: string
+  /** 发布序号（同一线自增，报出版本 v1/v2…） */
+  versionNo: number
+  /** 发布说明：初版 / 洪水后水尺接测重算 等 */
+  reason: string
+  /** 发布时的定线参数快照 */
+  a: number
+  b: number
+  h0: number
+  sampleCount: number
+  meanResidualPct: number
+  maxResidualPct: number
+  r2: number
+  valid: boolean
+  message: string
+  /** 发布时各点据的基面水位与流量快照（留档当时那版的点据，不随后续改动漂移） */
+  points: Array<{
+    ratingId: string
+    stationId: string
+    gaugeStageM: number
+    datumZeroElevM: number | null
+    datumStageM: number
+    flowM3s: number
+    datumSurveyId: string | null
+  }>
+  /** 发布当时的比测结论快照（曲线流量、偏差、合格/超限一并留档可查） */
+  compares: Array<{
+    ratingId: string
+    measuredFlow: number
+    curveFlow: number
+    deviationPct: number
+    verdict: '合格' | '超限'
+    operator: string
+    comparedAt: string
+  }>
+  /** 发布人 */
+  publisher: string
+  /** 发布时间（报出时间） */
+  publishedAt: string
   createdAt: number
   updatedAt: number
 }
@@ -163,4 +230,30 @@ export function curveFlow(fit: RatingFitResult, stageM: number): number {
   if (!fit.valid) return 0
   const value = fit.a * Math.pow(Math.max(stageM - fit.h0, 1e-6), fit.b)
   return Number(value.toFixed(2))
+}
+
+/** 参与基面折算定线的点据状态（「待站上认」的点据剔除，不参与） */
+export const FITTABLE_DATUM_STATUSES: DatumStatus[] = ['resolved', 'backfilled']
+
+/** 可参与基面定线的点据最小结构（种子数据可缺时间戳） */
+export type DatumFittable = Pick<
+  Rating,
+  'lineNo' | 'flowM3s' | 'datumStatus' | 'datumStageM'
+>
+
+/**
+ * 资料室定线口径：按各点据「测流当时那次零点」折到同一基面后的 datumStageM 拟合。
+ * datumStatus 为 pending（对不上时间、待站上认）的点据不参与定线。
+ */
+export function fitRatingsOnDatum(ratings: DatumFittable[], lineNo: string): RatingFitResult {
+  const points = ratings
+    .filter(
+      (rating) =>
+        rating.lineNo === lineNo &&
+        FITTABLE_DATUM_STATUSES.includes(rating.datumStatus) &&
+        typeof rating.datumStageM === 'number' &&
+        Number.isFinite(rating.datumStageM)
+    )
+    .map((rating) => ({ stageM: rating.datumStageM as number, flowM3s: rating.flowM3s }))
+  return fitPowerCurve(points, lineNo)
 }

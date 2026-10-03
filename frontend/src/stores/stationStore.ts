@@ -121,11 +121,20 @@ export const useStationStore = defineStore('station', () => {
     await db.stations.update(id, { ...patch, updatedAt: Date.now() } as never)
   }
 
-  /** 删除测站：级联删除其断面、垂线、测点、点据与比测记录 */
+  /** 删除测站：级联删除其断面、垂线、测点、点据、比测记录、水尺接测与报出版本 */
   async function removeStation(id: string): Promise<void> {
     await db.transaction(
       'rw',
-      [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+      [
+        db.stations,
+        db.sections,
+        db.verticals,
+        db.points,
+        db.ratings,
+        db.compares,
+        db.gaugeSurveys,
+        db.ratingVersions
+      ],
       async () => {
         const sectionIds = (await db.sections.where('stationId').equals(id).toArray()).map((row) => row.id)
         const verticalIds =
@@ -143,6 +152,17 @@ export const useStationStore = defineStore('station', () => {
         if (ratingIds.length > 0) {
           await db.compares.where('ratingId').anyOf(ratingIds).delete()
           await db.ratings.where('stationId').equals(id).delete()
+        }
+        // 删除该站水尺接测；仅当某报出版本的点据全部来自该站时才删该版本（跨站版本保留快照）
+        await db.gaugeSurveys.where('stationId').equals(id).delete()
+        const leftoverVersions = (await db.ratingVersions.toArray())
+          .filter(
+            (version) =>
+              version.points.length > 0 && version.points.every((point) => point.stationId === id)
+          )
+          .map((version) => version.id)
+        if (leftoverVersions.length > 0) {
+          await db.ratingVersions.bulkDelete(leftoverVersions)
         }
         await db.stations.delete(id)
       }
